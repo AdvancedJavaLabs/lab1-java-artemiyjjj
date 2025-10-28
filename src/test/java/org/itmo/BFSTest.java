@@ -26,8 +26,8 @@ public class BFSTest {
                 long serialTime = executeSerialBfsAndGetTime(g);
                 long parallelTime = executeParallelBfsAndGetTime(g);
                 fw.append("Times for " + sizes[i] + " vertices and " + connections[i] + " connections: ");
-                fw.append("\nSerial: " + serialTime);
-                fw.append("\nParallel: " + parallelTime);
+                fw.append("\nSerial: " + serialTime + " ms");
+                fw.append("\nParallel: " + parallelTime + " ms");
                 fw.append("\n--------\n");
             }
             fw.flush();
