@@ -2,34 +2,29 @@ package org.itmo;
 
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collector;
-import java.util.stream.Collectors;
 
 class Graph {
     private final int V;
     private final List<Integer>[] adjList;
 
     private final int threads;
+    private final AtomicInteger waitingThreads = new AtomicInteger();
     private final ThreadPoolExecutor pool;
-    // private final ConcurrentLinkedQueue<Integer> visited;
     private final boolean[] visited;
     // Очередь с батчами вершин
     private final Queue<List<Integer>> nodeQueue;
+    private final Queue<List<Integer>> newNodeQueue;
     // private final Queue<Integer> levelQueue;
     private final PriorityBlockingQueue<Runnable> tasks;
-    private final Semaphore busySemaphore;
+    // private final Semaphore busySemaphore;
 
-    // public ConcurrentLinkedQueue<Integer> getVisited() {
-    //     return this.visited;
-    // }
     public boolean[] getVisited() {
         return this.visited;
     }
 
     
-    public Queue<List<Integer>> getNodQueue() {
+    public Queue<List<Integer>> getNodeQueue() {
         return this.nodeQueue;
     }
 
@@ -38,23 +33,22 @@ class Graph {
         return this.tasks;
     }
 
+    @SuppressWarnings("unchecked")
     Graph(int vertices) {
         this.V = vertices;
         this.adjList = new ArrayList[vertices];
         for (int i = 0; i < vertices; ++i) {
             adjList[i] = new ArrayList<>();
         }
-        // this.visited = new ConcurrentLinkedQueue<>();
         this.visited = new boolean[this.V];
         this.nodeQueue = new ConcurrentLinkedQueue <List<Integer>>();
-        // this.levelQueue = new ConcurrentLinkedQueue<>();
+        this.newNodeQueue = new ConcurrentLinkedQueue<>();
         
         this.threads = Runtime.getRuntime().availableProcessors();
+        this.waitingThreads.set(0);
         System.out.println("CPUS: " + threads);
-        // Comparator<Runnable> comp = (t1, t2) -> Integer.compare(((BFSRunnable)t1).getLayer(), ((BFSRunnable)t2).getLayer());
-        this.tasks = new PriorityBlockingQueue<>(V); // ,comp
+        this.tasks = new PriorityBlockingQueue<>(V);
         this.pool = new ThreadPoolExecutor(threads, threads, 0L, TimeUnit.MILLISECONDS, tasks, new ThreadPoolExecutor.CallerRunsPolicy());
-        this.busySemaphore = new Semaphore(threads);
     }
 
     void addEdge(int src, int dest) {
@@ -64,48 +58,58 @@ class Graph {
     }
 
     class BFSRunnable implements Runnable {
-        private final List<Integer> vertices;
+        private List<Integer> vertices;
         private final Graph g;
-        // Необходимо для гарантии обработки узлов одного уровня
-        // private final Integer layer;
 
-        // public Integer getLayer() {
-        //     return this.layer;
-        // }
-
-        // might remove leyer
-        public BFSRunnable (List<Integer> vertices, Integer layer, Graph g) throws InterruptedException {
-            this.vertices = vertices;
-            // this.layer = layer;
+        public BFSRunnable (Graph g) throws InterruptedException {
             this.g = g;
-            g.busySemaphore.acquire();
         }
 
         @Override
         public void run() {
             List<Integer> nodesToVisit = new ArrayList<>();
-            for (int vertex : this.vertices) {
-                for (int n : g.adjList[vertex]) {
-                    visited[n] = true;
-                    nodesToVisit.add(n);
-                    // g.getVisited().add(n);
-                    // g.getTasks().add(new BFSRunnable(n, this.layer + 1, g));
-                    // g.pool.execute(new BFSRunnable(n, this.layer + 1, g));
-                    // nodeQueue.add(n);
+            
+            while (true) {
+                synchronized (g.nodeQueue) {
+                    try {
+                        while (g.nodeQueue.size() == 0) {
+                            g.waitingThreads.incrementAndGet();
+                            g.nodeQueue.wait();
+                            g.waitingThreads.decrementAndGet();
+                        }
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                    this.vertices = g.nodeQueue.poll();
+                }
+                for (int vertex : this.vertices) {
+                    for (int n : g.adjList[vertex]) {
+                        g.visited[n] = true;
+                        nodesToVisit.add(n);
+                    }
+                }
+                // may split these batches to fixed size arrays to provide liveness
+                synchronized (g.newNodeQueue) {
+                g.newNodeQueue.add(List.copyOf(nodesToVisit));
+                nodesToVisit.clear();
+                g.newNodeQueue.notifyAll();
                 }
             }
-            // may split these batches to fixed size arrays to provide liveness
-            g.nodeQueue.add(nodesToVisit); // List.copyOf(nodesToVisit)
-            g.busySemaphore.release();
         }
     }
 
     void parallelBFS(int startVertex) throws InterruptedException {
+        for (int i = 0; i < threads; i++) {
+            pool.execute(new BFSRunnable(this));
+        }
         // int debug = 0;
         visited[startVertex] = true;
         List<Integer> initial = new ArrayList<Integer>();
         initial.add(startVertex);
-        nodeQueue.add(initial);
+        synchronized (nodeQueue) {
+            nodeQueue.add(initial);
+            nodeQueue.notifyAll();
+        }
         // Нужен барьер для ограничения работы внутри одного уровня графа
         // 1. Потоки будут добвалять новые ноды в одну очередь, а синхронизирующий
         //  поток дожидается выполнения всех потоков на одном уровне, и добавляет все
@@ -117,11 +121,23 @@ class Graph {
         // общих на все потоки коллекций с узлами.
 
         // while (!nodeQueue.isEmpty() || pool.getActiveCount() != 0) {
-        while (busySemaphore.availablePermits() != threads) { // добавить стркутуру которой потоки будут сигнализировать, что они в работе (конд вар?)
-            if (!nodeQueue.isEmpty()) {
-                pool.execute(new BFSRunnable(nodeQueue.poll(), 0, this));
+        
+        while (waitingThreads.get() != threads || !nodeQueue.isEmpty() || !newNodeQueue.isEmpty()) {
+            List<Integer> list;
+            synchronized (newNodeQueue) {
+                try {
+                    while (newNodeQueue.isEmpty()) {
+                        newNodeQueue.wait();
+                    }
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+                list = newNodeQueue.poll();
             }
-            // debug++;
+            synchronized (nodeQueue) {
+                nodeQueue.add(list);
+                nodeQueue.notifyAll();
+            }
         }
         pool.shutdown();
 
@@ -173,5 +189,4 @@ class Graph {
             }
         }
     }
-
 }
