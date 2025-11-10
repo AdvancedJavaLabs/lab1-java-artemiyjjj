@@ -3,173 +3,299 @@ package org.itmo;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 class Graph {
     private final int V;
     private final List<Integer>[] adjList;
-
     private final int threads;
-    private final AtomicInteger waitingThreads = new AtomicInteger();
     private final ThreadPoolExecutor pool;
     private final boolean[] visited;
-    // Очередь с батчами вершин
-    private final Queue<List<Integer>> nodeQueue;
-    private final Queue<List<Integer>> newNodeQueue;
-    // private final Queue<Integer> levelQueue;
-    private final PriorityBlockingQueue<Runnable> tasks;
-    // private final Semaphore busySemaphore;
-
-    public boolean[] getVisited() {
-        return this.visited;
-    }
-
+    private final AtomicInteger[] visitedAtomic; // Атомарные флаги для каждой вершины
     
-    public Queue<List<Integer>> getNodeQueue() {
-        return this.nodeQueue;
-    }
-
-    
-    public PriorityBlockingQueue<Runnable> getTasks() {
-        return this.tasks;
-    }
+    // Основные структуры данных
+    private final ConcurrentLinkedQueue<List<Integer>> globalQueue;
+    private final List<ConcurrentLinkedQueue<List<Integer>>> workerQueues;
+    private final Phaser levelPhaser;
+    private final AtomicInteger activeWorkers = new AtomicInteger(0);
+    private final Lock workLock = new ReentrantLock();
+    private final Condition workAvailable = workLock.newCondition();
+    private final Condition levelCompleted = workLock.newCondition();
+    private volatile boolean terminationSignal = false;
+    private volatile int currentLevel = 0;
+    private final AtomicInteger pendingAdds = new AtomicInteger(0);
 
     @SuppressWarnings("unchecked")
-    Graph(int vertices) {
+    public Graph(int vertices) {
         this.V = vertices;
         this.adjList = new ArrayList[vertices];
+        this.visitedAtomic = new AtomicInteger[vertices];
         for (int i = 0; i < vertices; ++i) {
             adjList[i] = new ArrayList<>();
+            visitedAtomic[i] = new AtomicInteger(0);
         }
         this.visited = new boolean[this.V];
-        this.nodeQueue = new ConcurrentLinkedQueue <List<Integer>>();
-        this.newNodeQueue = new ConcurrentLinkedQueue<>();
         
         this.threads = Runtime.getRuntime().availableProcessors();
-        this.waitingThreads.set(0);
-        System.out.println("CPUS: " + threads);
-        this.tasks = new PriorityBlockingQueue<>(V);
-        this.pool = new ThreadPoolExecutor(threads, threads, 0L, TimeUnit.MILLISECONDS, tasks, new ThreadPoolExecutor.CallerRunsPolicy());
+        System.out.println("CPUs: " + threads);
+        
+        // Инициализация очередей
+        this.globalQueue = new ConcurrentLinkedQueue<>();
+        this.workerQueues = new ArrayList<>(threads);
+        for (int i = 0; i < threads; i++) {
+            workerQueues.add(new ConcurrentLinkedQueue<>());
+        }
+        
+        this.levelPhaser = new Phaser(1);
+        
+        this.pool = new ThreadPoolExecutor(
+            threads, threads, 0L, TimeUnit.MILLISECONDS,
+            new LinkedBlockingQueue<>(),
+            new ThreadPoolExecutor.CallerRunsPolicy()
+        );
     }
 
-    void addEdge(int src, int dest) {
+    public void addEdge(int src, int dest) {
         if (!adjList[src].contains(dest)) {
             adjList[src].add(dest);
         }
     }
 
     class BFSRunnable implements Runnable {
-        private List<Integer> vertices;
-        private final Graph g;
+        private final int workerId;
+        private final Graph graph;
 
-        public BFSRunnable (Graph g) throws InterruptedException {
-            this.g = g;
+        public BFSRunnable(Graph graph, int workerId) {
+            this.graph = graph;
+            this.workerId = workerId;
         }
 
         @Override
         public void run() {
-            List<Integer> nodesToVisit = new ArrayList<>();
+            try {
+                graph.levelPhaser.register();
+                
+                while (!terminationSignal) {
+                    // Ожидаем начала нового уровня
+                    int phase = graph.levelPhaser.arriveAndAwaitAdvance();
+                    
+                    if (terminationSignal) {
+                        break;
+                    }
+                    
+                    // Сообщаем о начале работы
+                    graph.activeWorkers.incrementAndGet();
+                    
+                    // Обрабатываем задачи текущего уровня
+                    processLevel();
+                    
+                    // Сообщаем о завершении работы
+                    graph.activeWorkers.decrementAndGet();
+                    
+                    // Уведомляем о возможном завершении уровня
+                    graph.signalLevelCompletion();
+                }
+            } catch (Exception e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                graph.levelPhaser.arriveAndDeregister();
+            }
+        }
+
+        private void processLevel() {
+            while (true) {
+                List<Integer> vertices = getTask();
+                
+                if (vertices == null) {
+                    // Попытка украсть работу
+                    vertices = stealWork();
+                    if (vertices == null) {
+                        // Больше нет работы на этом уровне
+                        break;
+                    }
+                }
+                
+                processVertices(vertices);
+            }
+        }
+
+        private List<Integer> getTask() {
+            List<Integer> task = workerQueues.get(workerId).poll();
+            if (task != null) {
+                return task;
+            }
+            return globalQueue.poll();
+        }
+
+        private List<Integer> stealWork() {
+            for (int i = 0; i < threads; i++) {
+                if (i != workerId) {
+                    List<Integer> stolenTask = workerQueues.get(i).poll();
+                    if (stolenTask != null) {
+                        return stolenTask;
+                    }
+                }
+            }
+            return null;
+        }
+
+        private void processVertices(List<Integer> vertices) {
+            List<Integer> newVertices = new ArrayList<>();
+            
+            for (int vertex : vertices) {
+                for (int neighbor : graph.adjList[vertex]) {
+                    // Атомарная проверка и установка с помощью CAS
+                    if (graph.visitedAtomic[neighbor].compareAndSet(0, 1)) {
+                        synchronized (graph.visited) {
+                            graph.visited[neighbor] = true;
+                        }
+                        newVertices.add(neighbor);
+                    }
+                }
+            }
+            
+            if (!newVertices.isEmpty()) {
+                graph.addToNextLevel(newVertices, workerId);
+            }
+        }
+    }
+
+    private void addToNextLevel(List<Integer> newVertices, int workerId) {
+        pendingAdds.incrementAndGet();
+        try {
+            workLock.lock();
+            try {
+                int targetWorker = (workerId + newVertices.size()) % threads;
+                workerQueues.get(targetWorker).offer(new ArrayList<>(newVertices));
+                workAvailable.signalAll();
+            } finally {
+                workLock.unlock();
+            }
+        } finally {
+            pendingAdds.decrementAndGet();
+            signalLevelCompletion();
+        }
+    }
+
+    private void signalLevelCompletion() {
+        workLock.lock();
+        try {
+            levelCompleted.signalAll();
+        } finally {
+            workLock.unlock();
+        }
+    }
+
+    public void parallelBFS(int startVertex) throws InterruptedException {
+        
+        // Инициализация
+        visited[startVertex] = true;
+        visitedAtomic[startVertex].set(1);
+        List<Integer> initialBatch = Collections.singletonList(startVertex);
+        globalQueue.offer(initialBatch);
+
+        for (int i = 0; i < threads; i++) {
+            pool.execute(new BFSRunnable(this, i));
+        }
+
+        int level = 0;
+        
+        while (true) {
+            
+            // Начинаем новый уровень
+            int phase = levelPhaser.arriveAndAwaitAdvance();
+            
+            // Ждем реального завершения уровня
+            if (!waitForTrueLevelCompletion()) {
+                break;
+            }
+            
+            // Подготавливаем следующий уровень
+            if (!prepareNextLevel()) {
+                break;
+            }
+            
+            level++;
+        }
+        
+        terminationSignal = true;
+        levelPhaser.arriveAndAwaitAdvance();
+        
+        pool.shutdown();
+        if (!pool.awaitTermination(2, TimeUnit.SECONDS)) {
+            pool.shutdownNow();
+        }
+    }
+
+    private boolean waitForTrueLevelCompletion() throws InterruptedException {
+        workLock.lock();
+        try {
+            long startTime = System.currentTimeMillis();
+            final long TIMEOUT_MS = 5000;
             
             while (true) {
-                synchronized (g.nodeQueue) {
-                    try {
-                        while (g.nodeQueue.size() == 0) {
-                            g.waitingThreads.incrementAndGet();
-                            g.nodeQueue.wait();
-                            g.waitingThreads.decrementAndGet();
+                boolean queuesEmpty = globalQueue.isEmpty();
+                for (ConcurrentLinkedQueue<List<Integer>> queue : workerQueues) {
+                    if (!queue.isEmpty()) {
+                        queuesEmpty = false;
+                        break;
+                    }
+                }
+                
+                boolean noActiveWorkers = activeWorkers.get() == 0;
+                boolean noPendingAdds = pendingAdds.get() == 0;
+                
+                if (queuesEmpty && noActiveWorkers && noPendingAdds) {
+                    // Двойная проверка для надежности
+                    Thread.sleep(1);
+                    boolean stillEmpty = globalQueue.isEmpty();
+                    for (ConcurrentLinkedQueue<List<Integer>> queue : workerQueues) {
+                        if (!queue.isEmpty()) {
+                            stillEmpty = false;
+                            break;
                         }
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
                     }
-                    this.vertices = g.nodeQueue.poll();
-                }
-                for (int vertex : this.vertices) {
-                    for (int n : g.adjList[vertex]) {
-                        g.visited[n] = true;
-                        nodesToVisit.add(n);
+                    if (stillEmpty && activeWorkers.get() == 0 && pendingAdds.get() == 0) {
+                        return true;
                     }
                 }
-                // may split these batches to fixed size arrays to provide liveness
-                synchronized (g.newNodeQueue) {
-                g.newNodeQueue.add(List.copyOf(nodesToVisit));
-                nodesToVisit.clear();
-                g.newNodeQueue.notifyAll();
+                
+                if (System.currentTimeMillis() - startTime > TIMEOUT_MS) {
+                    System.err.println("Timeout waiting for level completion");
+                    return false;
                 }
+                
+                levelCompleted.await(100, TimeUnit.MILLISECONDS);
             }
+        } finally {
+            workLock.unlock();
         }
     }
 
-    void parallelBFS(int startVertex) throws InterruptedException {
-        for (int i = 0; i < threads; i++) {
-            pool.execute(new BFSRunnable(this));
-        }
-        // int debug = 0;
-        visited[startVertex] = true;
-        List<Integer> initial = new ArrayList<Integer>();
-        initial.add(startVertex);
-        synchronized (nodeQueue) {
-            nodeQueue.add(initial);
-            nodeQueue.notifyAll();
-        }
-        // Нужен барьер для ограничения работы внутри одного уровня графа
-        // 1. Потоки будут добвалять новые ноды в одну очередь, а синхронизирующий
-        //  поток дожидается выполнения всех потоков на одном уровне, и добавляет все
-        // новые ноды в очередь задачь для потоков
-        // 2. Явный барьер, изменение состояния которого потоки будут ждать
-        // 3. Экзекьютор имеет приоритетную очередь для выполнения тасок, что даёт
-        // гарантию начала исполнения тасок для всех узлов одного уровня прежде начала
-        // исполнения тасок для узлов следующего. Убирает необходимость в дополнительных 
-        // общих на все потоки коллекций с узлами.
-
-        // while (!nodeQueue.isEmpty() || pool.getActiveCount() != 0) {
-        
-        while (waitingThreads.get() != threads || !nodeQueue.isEmpty() || !newNodeQueue.isEmpty()) {
-            List<Integer> list;
-            synchronized (newNodeQueue) {
-                try {
-                    while (newNodeQueue.isEmpty()) {
-                        newNodeQueue.wait();
-                    }
-                } catch (InterruptedException e) {
-                    e.printStackTrace();
+    private boolean prepareNextLevel() {
+        workLock.lock();
+        try {
+            // Собираем все задачи для следующего уровня
+            boolean hasWork = !globalQueue.isEmpty();
+            
+            for (ConcurrentLinkedQueue<List<Integer>> workerQueue : workerQueues) {
+                List<Integer> batch;
+                while ((batch = workerQueue.poll()) != null) {
+                    globalQueue.offer(batch);
+                    hasWork = true;
                 }
-                list = newNodeQueue.poll();
             }
-            synchronized (nodeQueue) {
-                nodeQueue.add(list);
-                nodeQueue.notifyAll();
-            }
+            
+            return hasWork;
+        } finally {
+            workLock.unlock();
         }
-        pool.shutdown();
-
-        // Отдаём всю очередь этого уровня на обработку потоку пулов
-        // while (!nodeQueue.isEmpty()) {
-            // while (!nodeQueue.isEmpty()) {
-            //     tasks.add(new BFSRunnable(nodeQueue.poll(), this, visited));
-            // }
-            // .. Когда очередь окажется пустой, дожидаемся завершения обработки всеми потоками
-            // long start = 
-            // next step - do not return futures, try concurent queue or smth faster
-            // List<Future<List<Integer>>> results = pool.invokeAll(tasks);
-            // .. Переходим на новый уровень, обновляя очередь задач для потоков
-            // for (Future<List<Integer>> elem : results) {
-            //     try {
-            //         nodeQueue.addAll(elem.get());
-            //     } catch (InterruptedException | ExecutionException e) {
-            //         throw new RuntimeException("This shouldn't happen because we get Done futures");
-            //     }
-            // }
-            // queue.addAll(results.stream().map(future -> {
-            //     try {
-            //         return future.get();
-            //     } catch (InterruptedException | ExecutionException e) {
-            //         throw new RuntimeException("This shouldn't happen because we get Done futures");
-            //     }
-            // }).collect(Collectors.toList()));
-            // tasks.clear();
-        // }
     }
 
-    //Generated by ChatGPT
+
+     //Generated by ChatGPT
     void bfs(int startVertex) {
         boolean[] visited = new boolean[V];
 
