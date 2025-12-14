@@ -21,6 +21,7 @@ class Graph {
     private final Condition queueReady = this.lock.newCondition();
     // private final Condition workersDone = lock.newCondition();
     private final AtomicBoolean isFinished = new AtomicBoolean(false);
+    private final int INTERPROCESS_BATCH = 50;
 
     Graph(int vertices) {
         this.V = vertices;
@@ -74,10 +75,15 @@ class Graph {
 
                 List<Integer> newVertices = new ArrayList<>();
                 while (vertices != null) {
+                   
                     for (Integer vertice : vertices) {
                         for (int n : graph.adjList[vertice]) {
                             if (!visited[n].getAndSet(true)) {
                                 newVertices.add(n);
+                            }
+                            if (INTERPROCESS_BATCH == newVertices.size()) {
+                                graph.workerQueues.add(new ArrayList<>(newVertices));
+                                newVertices.clear();
                             }
                         }
                     }
