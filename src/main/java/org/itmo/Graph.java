@@ -7,13 +7,13 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
-class Graph {
+public class Graph {
     private final int V;
     private final ArrayList<Integer>[] adjList;
     AtomicBoolean[] visited;
 
-    private final ConcurrentLinkedQueue<List<Integer>> globalQueue;
-    private final ConcurrentLinkedQueue<List<Integer>> workerQueues;
+    public final ConcurrentLinkedQueue<List<Integer>> globalQueue;
+    public final ConcurrentLinkedQueue<List<Integer>> workerQueues;
     private final ExecutorService executor;
     private final int cpus;
     private volatile CountDownLatch latch;
@@ -23,7 +23,12 @@ class Graph {
     private final AtomicBoolean isFinished = new AtomicBoolean(false);
     private final int INTERPROCESS_BATCH = 50;
 
-    Graph(int vertices) {
+    public ArrayList<Integer>[] getAdjList() {
+        return this.adjList;
+    }
+
+    public Graph(int vertices) {
+        
         this.V = vertices;
         this.visited = new AtomicBoolean[V];
         adjList = new ArrayList[vertices];
